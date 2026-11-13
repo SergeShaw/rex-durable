@@ -123,8 +123,12 @@ sleep 1
 # A restored tab that is busy for a few seconds, as when a shell's startup runs
 # commands: rex-durable must wait for it, then reopen its chat.
 R do -s side -e "rex.block.call('com.superlogical.terminal', 'write', \
-  { block_id = '$(block "$before" side 1.1)', data = 'sleep 6\\n' }) return 'ok'" >/dev/null
-sleep 1
+  { block_id = '$(block "$before" side 1.1)', data = 'sleep 8\\n' }) return 'ok'" >/dev/null
+# Wait until it really runs: a shell that is still starting runs it later.
+for _ in $(seq 1 40); do
+  [ "$(running "sleep 8")" = 1 ] && break
+  sleep 0.25
+done
 D mode=startup >"$T/startup.log"
 sleep 3
 D mode=save

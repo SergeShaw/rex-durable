@@ -10,6 +10,11 @@
 # Remove it with ./uninstall.sh.
 set -eu
 
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+  echo "install.sh: HOME is not set to a folder" >&2
+  exit 1
+fi
+
 here=$(cd "$(dirname "$0")" && pwd)
 os=$(uname -s)
 add_to_config=0

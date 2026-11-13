@@ -7,6 +7,11 @@
 # Your Rex sessions and the programs in them are not touched.
 set -eu
 
+if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
+  echo "uninstall.sh: HOME is not set to a folder" >&2
+  exit 1
+fi
+
 purge=0
 for arg in "$@"; do
   case "$arg" in
