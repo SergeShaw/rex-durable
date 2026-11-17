@@ -102,6 +102,8 @@ if [ "$service" = 1 ]; then
     label=io.github.fazxes.rex-durable
     plist="$HOME/Library/LaunchAgents/$label.plist"
     mkdir -p "$HOME/Library/LaunchAgents" "$(dirname "$log")"
+    touch "$log"
+    chmod 600 "$log"
     cat >"$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
