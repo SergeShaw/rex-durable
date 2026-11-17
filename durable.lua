@@ -25,7 +25,7 @@ https://github.com/fazxes/rex-durable (MIT License)
 ]]
 
 local M = {}
-M.VERSION = "0.1.0"
+M.VERSION = "0.2.0"
 
 local TERMINAL = "com.superlogical.terminal"
 local SHELL_FLAVOR = "com.superlogical.terminal.shell"
@@ -128,6 +128,7 @@ local function write_file(path, data)
   if not f then return nil, err end
   f:write(data)
   f:close()
+  run({ "chmod", "600", tmp })
   return os.rename(tmp, path)
 end
 
@@ -173,6 +174,32 @@ local SNAP_DIR = STATE_DIR .. "/snapshots"
 local CHECKPOINT_DIR = STATE_DIR .. "/checkpoints"
 local STATE_FILE = STATE_DIR .. "/state.json"
 M.STATE_DIR = STATE_DIR
+
+-- Machine-specific paths stay in private state, never in the installed source.
+local config_path = STATE_DIR .. "/config.json"
+local config = read_json(config_path)
+if file_exists(config_path) then assert(type(config) == "table", "invalid " .. config_path) end
+config = config or {}
+if args.programs == nil then args.programs = config.programs end
+function M.validate_profiles(profiles)
+  assert(type(profiles) == "table", "codex_profiles must be an array")
+  for key in pairs(profiles) do
+    assert(type(key) == "number" and key >= 1 and key <= #profiles and key % 1 == 0,
+      "codex_profiles must be an array")
+  end
+  return profiles
+end
+M.codex_profiles = M.validate_profiles(config.codex_profiles == nil and {} or config.codex_profiles)
+local profile_homes = {}
+for _, profile in ipairs(M.codex_profiles) do
+  assert(type(profile) == "table" and type(profile.home) == "string"
+    and profile.home:match("^/.+") and not profile.home:find("[%c]")
+    and type(profile.launcher) == "string" and profile.launcher:match("^/.+")
+    and not profile.launcher:find("[%c]"), "invalid Codex profile in " .. config_path)
+  profile.home = profile.home:gsub("/+$", "")
+  assert(profile.home ~= "" and not profile_homes[profile.home], "duplicate/invalid Codex home")
+  profile_homes[profile.home] = true
+end
 
 local function notify(message)
   if args.notify == false then return end
@@ -350,6 +377,85 @@ function M.codex_session(files, home)
   end
 end
 
+-- An explicit profile must be backed by that TUI's open runtime files. The
+-- shared daemon owns rollouts; the TUI itself still opens its profile's log DB.
+function M.codex_profile(files, profiles)
+  local found
+  for _, profile in ipairs(profiles or M.codex_profiles) do
+    for _, path in ipairs(list(files)) do
+      local rest = under(path, profile.home .. "/")
+      if rest and (rest:match("^logs_%d+%.sqlite$") or rest:match("^tmp/arg0[^/]*/[^/]+/%.lock$")) then
+        if found and found.home ~= profile.home then return nil end
+        found = profile
+      end
+    end
+  end
+  return found
+end
+
+-- Codex separates terminal-title components with '|', and can truncate the ID.
+-- Never accept a short fragment or choose between conflicting ID fields.
+-- An unnamed chat's title can repeat its full ID before the shortened ID field.
+function M.codex_title_prefix(title)
+  local found
+  for field in ((title or "") .. "|"):gmatch("(.-)|") do
+    field = field:match("^%s*(.-)%s*$"):gsub("%.%.%.$", ""):gsub("…$", ""):lower()
+    if #field >= 24 and #field <= 36 and not field:find("[^%x%-]") then
+      local valid = true
+      for i = 1, #field do
+        local hyphen = i == 9 or i == 14 or i == 19 or i == 24
+        if (field:sub(i, i) == "-") ~= hyphen then valid = false end
+      end
+      if valid then
+        if not found or field:sub(1, #found) == found then
+          found = field
+        elseif found:sub(1, #field) ~= field then
+          return nil
+        end
+      end
+    end
+  end
+  return found
+end
+
+local function codex_database(home)
+  local best, version = nil, -1
+  for _, path in ipairs(list_dir(home, ".sqlite")) do
+    local n = tonumber((basename(path):match("^state_(%d+)%.sqlite$")))
+    if n and n > version then best, version = path, n end
+  end
+  return best
+end
+
+local function codex_rows(home, prefix)
+  local db = codex_database(home)
+  if not db then return nil end
+  -- prefix contains only validated hexadecimal digits and UUID separators.
+  local sql = "SELECT id, rollout_path, cwd FROM threads WHERE archived=0 AND id LIKE '"
+    .. prefix .. "%' LIMIT 2;"
+  local r = run({ "sqlite3", "-init", "/dev/null", "-readonly", "-json", db, sql }, { timeout = 5 })
+  if not (r and r.ok) then return nil end
+  return rex.json.decode(r.stdout)
+end
+
+function M.codex_title_session(pane, title, profile, query)
+  local owner = title and title.owner
+  if not owner or owner.pid ~= pane.pid or basename(owner.name) ~= "codex" then
+    return nil, "Codex does not own the current terminal title"
+  end
+  local prefix = M.codex_title_prefix(title.title)
+  if not prefix then return nil, "terminal title has no unambiguous conversation ID" end
+  local rows = (query or codex_rows)(profile.home, prefix)
+  if type(rows) ~= "table" or #rows ~= 1 then return nil, "conversation ID is missing or ambiguous in profile" end
+  local row = rows[1]
+  if type(row.id) ~= "string" or not row.id:match("^" .. UUID .. "$")
+    or row.id:sub(1, #prefix):lower() ~= prefix or row.cwd ~= pane.cwd
+    or type(row.rollout_path) ~= "string" or not under(row.rollout_path, profile.home .. "/sessions/") then
+    return nil, "conversation metadata does not match this profile and folder"
+  end
+  return row
+end
+
 -- Claude Code writes ~/.claude/projects/<folder with non-alphanumerics as ->/<id>.jsonl.
 function M.claude_slug(cwd) return (tostring(cwd or ""):gsub("[^%w]", "-")) end
 
@@ -502,11 +608,11 @@ function M.panes(node, out)
   return out
 end
 
-local function convert(node, procs, info, pending)
+local function convert(node, procs, info, pending, titles)
   if type(node) ~= "table" then return nil end
   if node.split then
-    local before = convert(node.split.before, procs, info, pending)
-    local after = convert(node.split.after, procs, info, pending)
+    local before = convert(node.split.before, procs, info, pending, titles)
+    local after = convert(node.split.after, procs, info, pending, titles)
     if not before or not after then return before or after end
     return { split = { direction = node.split.direction, ratio = node.split.ratio or 0.5,
                        before = before, after = after } }
@@ -516,6 +622,24 @@ local function convert(node, procs, info, pending)
   local pane = M.describe(proc, info)
   pane.block_id = node.block_id
   pane.focused = node.focused and true or false
+  if pane.app == "codex" and #M.codex_profiles > 0 then
+    local profile = M.codex_profile(info.files[pane.pid])
+    local row, reason
+    if profile then row, reason = M.codex_title_session(pane, titles[node.block_id], profile) end
+    -- Launch arguments may refer to a conversation superseded by /new or /resume.
+    -- An unknown identity must not fall back to argv, timestamps, or plain codex.
+    pane.id, pane.session_file = nil, nil
+    if row then
+      pane.id, pane.session_file = row.id, row.rollout_path
+      pane.codex_home, pane.codex_launcher = profile.home, profile.launcher
+      pane.identity = "terminal-title"
+    else
+      pane.kind, pane.note = "unknown", reason or "Codex profile is not identified or configured"
+    end
+    local argv = { pane.argv[1] or "codex" }
+    for _, word in ipairs(M.kept_options(pane.argv, M.CHATS.codex)) do argv[#argv + 1] = word end
+    pane.argv = argv
+  end
   if pane.kind == "chat" and not pane.id then pending[#pending + 1] = pane end
   return { pane = pane }
 end
@@ -527,7 +651,7 @@ local function collect()
   for _, s in ipairs(list(listing.sessions)) do
     rex.session.attach{ session_id = s.session_id }
     local view, err = rex.session.view{ session_id = s.session_id }
-    local entry = { id = s.session_id, label = s.label, view = view, procs = {} }
+    local entry = { id = s.session_id, label = s.label, view = view, procs = {}, titles = {} }
     if not view then log("couldn't read session " .. tostring(s.label) .. ": " .. tostring(err)) end
     for _, w in ipairs(list(view and view.windows)) do
       for _, layer in ipairs(list(w.layers)) do
@@ -536,6 +660,10 @@ local function collect()
             local proc = rex.block.call(TERMINAL, "process",
               { session_id = s.session_id, block_id = b.block_id }) or {}
             entry.procs[b.block_id] = proc
+            if #M.codex_profiles > 0 then
+              entry.titles[b.block_id] = rex.block.call(TERMINAL, "title",
+                { session_id = s.session_id, block_id = b.block_id })
+            end
             for _, p in ipairs(M.chain_of(proc)) do pids[#pids + 1] = p.pid end
           end
         end
@@ -554,7 +682,7 @@ local function collect()
         for _, layer in ipairs(list(w.layers)) do
           if layer.kind == "tiled" then tiled = layer break end
         end
-        local layout = tiled and convert(tiled.layout, entry.procs, info, pending)
+        local layout = tiled and convert(tiled.layout, entry.procs, info, pending, entry.titles)
         if layout then
           local label = w.label
           local short = label and label:match("^Window (%x%x%x%x%x%x%x%x)$")
@@ -584,7 +712,10 @@ M.collect = collect
 ---------------------------------------------------------------------------
 -- Saves
 
-local function ensure_dirs() run({ "mkdir", "-p", SNAP_DIR, CHECKPOINT_DIR }) end
+local function ensure_dirs()
+  run({ "mkdir", "-p", SNAP_DIR, CHECKPOINT_DIR })
+  run({ "chmod", "700", STATE_DIR, SNAP_DIR, CHECKPOINT_DIR })
+end
 
 local function snapshot_path(instance) return SNAP_DIR .. "/" .. instance .. ".json" end
 
@@ -646,7 +777,7 @@ function M.is_blank(snap)
 end
 
 function M.summary(snap)
-  local sessions, tabs, chats, programs = 0, 0, 0, 0
+  local sessions, tabs, chats, programs, unknown = 0, 0, 0, 0, 0
   local apps = {}
   for _, s in ipairs(list(snap and snap.sessions)) do
     if not M.is_default_session(s) then
@@ -659,6 +790,8 @@ function M.summary(snap)
             apps[p.app] = (apps[p.app] or 0) + 1
           elseif p.kind == "program" then
             programs = programs + 1
+          elseif p.kind == "unknown" then
+            unknown = unknown + 1
           end
         end
       end
@@ -670,6 +803,7 @@ function M.summary(snap)
   end
   local text = string.format("%d sessions, %d tabs, %d chats", sessions, tabs, chats)
   if #parts > 0 then text = text .. " (" .. table.concat(parts, ", ") .. ")" end
+  if unknown > 0 then text = text .. string.format(", %d unidentified (not restored)", unknown) end
   return text .. string.format(", %d other programs", programs), chats, programs
 end
 
@@ -720,6 +854,16 @@ function M.resume_argv(pane, accepts)
   accepts = accepts or fx_accepts
   local exe = chat_executable(pane)
   local argv = { exe }
+  if pane.app == "codex" and #M.codex_profiles > 0
+    and (not pane.codex_home or pane.identity ~= "terminal-title") then return nil end
+  if pane.codex_home then
+    local approved = false
+    for _, profile in ipairs(M.codex_profiles) do
+      if profile.home == pane.codex_home and profile.launcher == pane.codex_launcher then approved = true end
+    end
+    if not approved or not file_exists(pane.codex_launcher) then return nil end
+    argv = { "env", "CODEX_HOME=" .. pane.codex_home, pane.codex_launcher }
+  end
   if pane.app == "codex" then argv[#argv + 1] = "resume" end
   local has_v2 = false
   for _, option in ipairs(M.kept_options(pane.argv, M.CHATS[pane.app])) do
@@ -745,17 +889,26 @@ function M.resume_argv(pane, accepts)
 end
 
 local function command_for(pane)
-  if pane.kind == "chat" then return M.join(M.resume_argv(pane)) .. "\n" end
+  if pane.kind == "chat" then
+    local argv = M.resume_argv(pane)
+    if argv then return M.join(argv) .. "\n" end
+  end
   if pane.kind == "program" and #list(pane.argv) > 0 then return M.join(pane.argv) end
 end
 
--- Chats already running, in Rex or anywhere else, so none is opened twice.
+function M.chat_key(pane)
+  if pane.kind ~= "chat" then return nil end
+  return pane.app .. ":" .. (pane.codex_home and (pane.codex_home .. ":") or "") .. tostring(pane.id)
+end
+
+-- Chats already running in Rex, plus external file holders for agents whose
+-- files are held by the interactive client rather than a shared daemon.
 local function open_chats(saved, live)
   local open = {}
   for _, s in ipairs(list(live and live.sessions)) do
     for _, w in ipairs(list(s.windows)) do
       for _, p in ipairs(M.panes(w.layout)) do
-        if p.kind == "chat" then open[p.app .. ":" .. p.id] = true end
+        if p.kind == "chat" then open[M.chat_key(p)] = true end
       end
     end
   end
@@ -769,9 +922,11 @@ local function open_chats(saved, live)
             path = HOME .. "/.fx/sessions/" ..
               (p.store == "v2" and ("v2/" .. p.id .. "/lock") or (p.id .. "/session.lock"))
           end
-          if path and p.app ~= "claude" then
+          -- The shared Codex daemon can hold a rollout with no TUI attached.
+          -- For title-identified chats, deduplicate by live Rex pane identity.
+          if path and p.app ~= "claude" and p.identity ~= "terminal-title" then
             paths[#paths + 1] = path
-            owner[path] = p.app .. ":" .. p.id
+            owner[path] = M.chat_key(p)
           end
         end
       end
@@ -826,12 +981,12 @@ function M.plan_reopen(saved, live, open, opts)
           local hit = by_block[p.block_id]
           local have, session_id = hit and hit.pane, hit and hit.session.session_id
           if not have and have_list then have, session_id = have_list[pi], target.session_id end
-          local key = p.kind == "chat" and (p.app .. ":" .. p.id)
+          local key = M.chat_key(p)
           if not have then
             notes[#notes + 1] = where .. ": no matching tab"
           elseif skip[have.block_id] then
             -- Typed into on an earlier try.
-          elseif (have.kind == "chat" and key == (have.app .. ":" .. tostring(have.id)))
+          elseif (have.kind == "chat" and key == M.chat_key(have))
             or (have.kind == "program" and p.kind == "program"
                 and M.join(list(have.argv)) == M.join(list(p.argv))) then
             -- Already running in its own tab.
@@ -926,7 +1081,7 @@ local function create_layout(node, open, leaves)
   leaves[#leaves + 1] = p
   local options = {}
   if p.cwd and dir_exists(p.cwd) then options.cwd = p.cwd end
-  local key = p.kind == "chat" and (p.app .. ":" .. p.id)
+  local key = M.chat_key(p)
   if not (key and open[key]) then
     local command = command_for(p)
     if command and (p.kind == "chat" or args.programs ~= false) then options.initial_input = command end
@@ -1098,7 +1253,8 @@ local function watch()
   end
   for _, event in ipairs({ "session_created", "session_destroyed", "session_view_changed",
                            "block_created", "block_closed", "terminal.child_exited",
-                           "terminal.pwd_changed", "terminal.program_status_changed" }) do
+                           "terminal.pwd_changed", "terminal.program_status_changed",
+                           "terminal.title_changed" }) do
     rex.on(event, soon)
   end
   log("rex-durable " .. M.VERSION .. " watching; saves in " .. STATE_DIR)

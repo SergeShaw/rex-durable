@@ -1,5 +1,8 @@
 # rex-durable
 
+This fork adds opt-in support for Codex profiles and a shared Codex daemon.
+The upstream behavior remains available when no profiles are configured.
+
 Keep the programs in your [Rex](https://www.superlogical.com/rex) tabs across server restarts and reboots.
 
 Rex saves your sessions, tabs, and splits when its server stops, and restores them when it starts again. The programs that were running in them don't come back: every tab returns as an empty shell. rex-durable remembers what was running in each tab and puts it back.
@@ -71,7 +74,7 @@ Add `programs=false` to any mode to reopen chats only, and never type other prog
 ## Safety
 
 - It only types into a tab that is sitting at an idle shell. A tab where something is running is left alone.
-- It never opens a chat twice: not if the chat is already running in a Rex tab, and not if another process holds its session file, such as the same chat open in another terminal.
+- It avoids opening a chat already detected in a Rex pane. For ordinary file-backed clients it also checks external holders of the session file. Profile-mode Codex chats are deduplicated across Rex panes only: a shared daemon can hold a session file without any terminal viewing that chat.
 - It acts once per server start. Running it again on the same server only saves.
 - Programs other than chats are typed, never run.
 - Saves older than 30 days are never restored on their own.
@@ -80,9 +83,58 @@ Add `programs=false` to any mode to reopen chats only, and never type other prog
 ## Limits
 
 - A chat that was in the middle of a reply reopens, but the reply in progress is gone, so re-ask its last step. Commands a chat had running in the background don't come back.
-- Only chats in your own home folder's profile are reopened. An fx chat run with a different `HOME`, such as a test profile, comes back typed, not run.
+- Without explicit Codex profiles, only chats in your own home folder's profile are reopened. An fx chat run with a different `HOME`, such as a test profile, comes back typed, not run.
 - It works with the server it runs next to. For a remote Rex server, install rex-durable on that machine.
 - A sudden power cut loses at most about the last 30 seconds of changes.
+
+## Codex profiles and shared daemons
+
+For a separate `CODEX_HOME`, create `config.json` in rex-durable's state
+directory (on macOS, `~/Library/Application Support/rex-durable/`):
+
+```json
+{
+  "programs": false,
+  "codex_profiles": [
+    {
+      "home": "/absolute/path/to/codex-profile",
+      "launcher": "/absolute/path/to/codex-launcher"
+    }
+  ]
+}
+```
+
+Use absolute paths, resolving directory symlinks in the profile home. The launcher is one executable, such as a wrapper that
+starts your work Codex configuration; it is not a shell command. A restore
+explicitly sets `CODEX_HOME` and invokes that launcher with `resume <id>`.
+The local configuration and saved chat IDs are not part of this repository.
+
+Include `thread-id` in that Codex profile's `tui.terminal_title`, for example
+`["thread-title", "thread-id", "project"]`. Rex must expose the title's owner.
+The TUI must have a profile log database or an argv-lock file open, so the
+profile can be established independently of the title. `sqlite3` with JSON
+output support must be installed.
+
+In this mode, every Codex pane requires a configured profile and a title owned
+by its current Codex process. A full or truncated UUID (at least 24 characters)
+must match exactly one unarchived conversation in that profile's newest
+`state_*.sqlite` index, with the same working folder. Only IDs and file/folder
+metadata are queried, read-only; conversation content is not read. Changing
+chats updates the saved ID through Rex's title-change event. Missing or
+ambiguous identities are saved as unidentified and never launched, even if
+the original command names an older conversation. Older snapshots without
+verified profile metadata cannot bypass profile mode.
+
+Shared-daemon Codex chats are deduplicated within the connected Rex server.
+This mode cannot determine whether the same chat is also open in another
+terminal application. It does not interpret a daemon holding the rollout as
+an active terminal. A restored conversation is reopened; interrupted work is
+not automatically submitted again.
+
+Install from a checked-out commit to pin the code. The installer records that
+commit in `REVISION` beside the installed script. Updates are manual. To roll
+back, check out the previous tested commit and rerun the installer; local
+configuration and snapshots are retained.
 
 ## Uninstall
 
@@ -99,9 +151,19 @@ Your Rex sessions and the programs in them are not touched. If you added `requir
 test/e2e.sh            # unit tests, then end-to-end tests on a throwaway Rex server
 test/e2e.sh --unit     # unit tests only
 lua5.1 test/platform.lua   # process and file helpers on Linux, without Rex
+python3 test/codex_profiles.py  # shared-daemon fixtures, separate Rex server
+python3 test/real_codex.py      # installed Codex, disposable profile, localhost-only endpoint
 ```
 
 The end-to-end test needs Rex and a C compiler. It runs its own Rex server on its own socket, with fake fx, Claude Code, and Codex chats in a throwaway home folder. It never connects to your Rex server and never touches your real chats.
+
+The opt-in real-Codex test needs Python 3.8+ and Codex CLI with shared-daemon
+support (validated with 0.169.0). It creates two disposable conversations
+against a local endpoint that returns a fixed error, opens their real TUIs,
+restarts only its separate Rex server, and checks both conversation IDs and
+the unchanged Codex daemon PID. It then repeats with both Rex and the test
+Codex daemon stopped, checking cold-daemon recovery. No work configuration or credentials are
+copied, and no AI service is called.
 
 rex-durable is not made by or affiliated with Superlogical.
 

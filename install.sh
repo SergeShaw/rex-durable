@@ -9,6 +9,7 @@
 #
 # Remove it with ./uninstall.sh.
 set -eu
+umask 077
 
 if [ -z "${HOME:-}" ] || [ ! -d "$HOME" ]; then
   echo "install.sh: HOME is not set to a folder" >&2
@@ -76,6 +77,7 @@ esac
 
 mkdir -p "$data"
 cp "$here/durable.lua" "$script.new" && mv "$script.new" "$script"
+git -C "$here" rev-parse HEAD >"$data/REVISION" 2>/dev/null || printf 'unknown\n' >"$data/REVISION"
 say "Installed $script"
 
 # A PATH for the service, so it finds lsof, fx, claude, and codex.

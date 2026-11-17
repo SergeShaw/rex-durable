@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -41,6 +42,10 @@ int main(int argc, char **argv) {
       snprintf(id, sizeof id, "%s", argv[++i]);
   }
   if (!id[0]) {
+    const char *fixture_id = getenv("REX_DURABLE_FAKE_ID");
+    if (fixture_id && !strcmp(app, "codex"))
+      snprintf(id, sizeof id, "%s", fixture_id);
+    else
     if (!strcmp(app, "fx"))
       snprintf(id, sizeof id, "new%d", (int)getpid());
     else
@@ -50,6 +55,24 @@ int main(int argc, char **argv) {
   char cwd[2048], dir[4096], file[4608];
   if (!getcwd(cwd, sizeof cwd)) return 1;
   int keep_open = 1;
+  if (!strcmp(app, "codex") && getenv("REX_DURABLE_FAKE_TITLES")) {
+    const char *profile = getenv("CODEX_HOME");
+    if (!profile) return 1;
+    snprintf(file, sizeof file, "%s/logs_2.sqlite", profile);
+    int log_fd = open(file, O_WRONLY | O_CREAT, 0600);
+    if (log_fd < 0) return 1;
+    printf("\033]0;fixture | %.26s... | project\007fake codex on %s\n", id, id);
+    fflush(stdout);
+    char input[256];
+    while (fgets(input, sizeof input, stdin)) {
+      if (!strncmp(input, "title ", 6)) {
+        input[strcspn(input, "\r\n")] = 0;
+        printf("\033]0;fixture | %s | project\007", input + 6);
+        fflush(stdout);
+      }
+    }
+    return 0;
+  }
   if (!strcmp(app, "fx")) {
     snprintf(dir, sizeof dir, "%s/.fx/sessions/v2/%s", FAKE_HOME, id);
     snprintf(file, sizeof file, "%s/lock", dir);

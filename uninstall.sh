@@ -39,7 +39,7 @@ else
   fi
 fi
 
-rm -f "$data/durable.lua" "$config/rex_durable.lua"
+rm -f "$data/durable.lua" "$data/REVISION" "$config/rex_durable.lua"
 if [ "$purge" = 1 ]; then
   rm -rf "$data" "$state"
   echo "Removed rex-durable and its saves."

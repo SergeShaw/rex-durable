@@ -176,5 +176,56 @@ check("a program still running in its tab is left alone quietly",
   { writes[1], notes }, { "b4=fx --resume C\n", { "work tab 2: the tab is busy, left alone" } })
 rex.exec = real_exec
 
+-- Shared-daemon Codex: the title is authoritative, and a configured profile
+-- must be tied to the TUI's runtime files before its index can be queried.
+local profile = { home = "/tmp/work profile", launcher = "/bin/sh" }
+check("custom profile runtime file", M.codex_profile({ profile.home .. "/logs_2.sqlite" }, { profile }), profile)
+check("custom profile argv lock", M.codex_profile({ profile.home .. "/tmp/arg0-macos/codex-arg0abc/.lock" }, { profile }), profile)
+check("rollout alone does not establish profile", M.codex_profile({ profile.home .. "/sessions/rollout.jsonl" }, { profile }), nil)
+check("profile prefix is not a path boundary", M.codex_profile({ profile.home .. "-other/logs_2.sqlite" }, { profile }), nil)
+local other_profile = { home = "/tmp/personal", launcher = "/bin/sh" }
+check("conflicting runtime files", M.codex_profile({ profile.home .. "/logs_2.sqlite", other_profile.home .. "/logs_2.sqlite" }, { profile, other_profile }), nil)
+local full_id = "aaaaaaaa-1111-4222-8333-bbbbbbbbbbbb"
+local prefix = full_id:sub(1, 26)
+check("truncated title ID", M.codex_title_prefix("Fix issue | " .. prefix .. "... | project"), prefix)
+check("unicode ellipsis", M.codex_title_prefix("Fix issue | " .. prefix .. "… | project"), prefix)
+check("full title ID", M.codex_title_prefix(full_id), full_id)
+check("unnamed chat repeats same ID", M.codex_title_prefix(full_id .. " | " .. prefix .. "... | project"), full_id)
+check("matching IDs in reverse order", M.codex_title_prefix(prefix .. "... | " .. full_id), full_id)
+check("ambiguous title fields", M.codex_title_prefix(full_id .. " | " .. uuid), nil)
+check("short title fragment", M.codex_title_prefix("aaaaaaaa-1111"), nil)
+check("non-UUID shape", M.codex_title_prefix("aaaaaaaaaaaaaaaaaaaaaaaaaaaa"), nil)
+local title_pane = { pid = 901, cwd = "/project" }
+local title = { title = "Fix | " .. prefix .. "... | project", owner = { pid = 901, name = "codex" } }
+local row = { id = full_id, cwd = "/project", rollout_path = profile.home .. "/sessions/rollout-" .. full_id .. ".jsonl" }
+local function one() return { row } end
+check("exact profile and unique ID", M.codex_title_session(title_pane, title, profile, one), row)
+local _, reason = M.codex_title_session(title_pane, title, profile, function() return { row, row } end)
+check("two index matches refused", reason, "conversation ID is missing or ambiguous in profile")
+check("missing index refused", M.codex_title_session(title_pane, title, profile, function() return nil end), nil)
+title.owner.pid = 902
+check("stale title owner refused", M.codex_title_session(title_pane, title, profile, one), nil)
+title.owner.pid, title.owner.name = 901, "zsh"
+check("shell title refused", M.codex_title_session(title_pane, title, profile, one), nil)
+title.owner.name = "codex"
+row.cwd = "/different"
+check("different working directory refused", M.codex_title_session(title_pane, title, profile, one), nil)
+row.cwd, row.rollout_path = "/project", "/tmp/other/sessions/rollout.jsonl"
+check("rollout outside profile refused", M.codex_title_session(title_pane, title, profile, one), nil)
+M.codex_profiles = { profile }
+local work_pane = { kind = "chat", app = "codex", id = full_id, codex_home = profile.home,
+                    codex_launcher = profile.launcher, identity = "terminal-title",
+                    argv = { "codex", "-m", "example" } }
+check("profile survives resume", cmd(work_pane),
+  "env 'CODEX_HOME=/tmp/work profile' /bin/sh resume -m example " .. full_id)
+local personal_pane = { kind = "chat", app = "codex", id = full_id }
+check("same ID different profile is distinct", M.chat_key(work_pane) == M.chat_key(personal_pane), false)
+check("legacy snapshot cannot bypass profile mode", M.resume_argv(personal_pane), nil)
+M.codex_profiles = {}
+check("removed profile cannot launch", M.resume_argv(work_pane), nil)
+check("string profile list rejected", (pcall(M.validate_profiles, "bad")), false)
+check("object profile list rejected", (pcall(M.validate_profiles, { home = "/tmp/work" })), false)
+check("boolean profile list rejected", (pcall(M.validate_profiles, false)), false)
+
 print(string.format("%d passed, %d failed", passed, failed))
 if failed > 0 then rex.stop(1) end
